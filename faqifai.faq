@@ -1,0 +1,35 @@
+ttl = "7d"
+output = "faqifai.md"
+scope = "src/**"
+context = "This is faqifai, a Rust CLI tool that discovers .faq files in a repository and uses GitHub Copilot to answer questions about the codebase, outputting terse markdown."
+
+[[question]]
+text = "How does the JSON-RPC transport work between faqifai and the Copilot CLI, and what framing protocol is used?"
+hints = ["src/copilot/jsonrpc.rs", "src/copilot/client.rs"]
+
+[[question]]
+text = "What security measures prevent the AI's tool calls from accessing files outside the workspace?"
+hints = ["src/codebase.rs"]
+
+[[question]]
+text = "How does the tool decide whether a previously generated answer is stale and needs regeneration?"
+hints = ["src/state.rs", "src/orchestrator.rs"]
+
+[[question]]
+text = "What is the eval tool and how does it differ from the other AI tools? What are its limitations compared to Python?"
+hints = ["src/eval.rs", "src/ai.rs"]
+
+[[question]]
+text = "How are multiple questions answered concurrently, and what controls the parallelism?"
+hints = ["src/ai.rs", "src/orchestrator.rs"]
+
+[[question]]
+text = "What prompts are given to Copilot for generating answers?"
+hints = []
+
+[[question]]
+text = "how does faqifai optimize token and request usage?"
+
+[[question]]
+text = "What models does faqifai use?"
+hints = []
