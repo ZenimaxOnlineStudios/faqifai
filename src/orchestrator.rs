@@ -267,7 +267,7 @@ pub fn status(root: &Path, scan_path: &Path) -> Result<()> {
             )?;
 
             let status_str = match &staleness {
-                Staleness::Fresh => "✓ fresh".to_string(),
+                Staleness::Fresh => "\x1b[32m✓\x1b[0m fresh".to_string(),
                 Staleness::NeverGenerated => "○ never generated".to_string(),
                 Staleness::TtlExpired => "⏰ TTL expired".to_string(),
                 Staleness::SourcesChanged(files) => {

@@ -20,12 +20,6 @@ impl CodebaseContext {
         }
     }
 
-    /// Track an individual file's hash
-    fn add_file_hash(&mut self, path: &str, content: &str) {
-        let hash = sha256_hex(content);
-        self.hashes.insert(path.to_string(), hash);
-    }
-
     /// Track a grouped source hash (directory merkle or glob merkle)
     fn add_source_hash(&mut self, key: String, hash: String) {
         self.hashes.insert(key, hash);

@@ -38,18 +38,29 @@ impl Session {
                             .context("Invalid tool.call params")?;
 
                         let tool_name = req.tool_name.clone();
-                        // For analyze, log the intent; for others, summarize args
-                        let log_summary = if tool_name == "analyze" {
-                            req.arguments.get("intent").and_then(|v| v.as_str())
-                                .unwrap_or("(no intent)").to_string()
-                        } else {
-                            summarize_args(&req.arguments)
-                        };
-                        eprintln!("  ⚙  {} {}", tool_name, log_summary);
+                        // mark_unchanged is signalled cleanly by ai.rs — skip tool log
+                        if tool_name != "mark_unchanged" {
+                            let log_summary = if tool_name == "analyze" {
+                                req.arguments.get("intent").and_then(|v| v.as_str())
+                                    .unwrap_or("(no intent)").to_string()
+                            } else {
+                                summarize_args(&req.arguments)
+                            };
+                            eprintln!("  ⚙  {} {}", tool_name, log_summary);
+                        }
 
-                        let handlers_lock = handlers.lock().await;
-                        let result = if let Some(handler) = handlers_lock.get(&req.tool_name) {
-                            handler(req.arguments)
+                        let handler = {
+                            let handlers_lock = handlers.lock().await;
+                            handlers_lock.get(&req.tool_name).cloned()
+                        };
+
+                        let result = if let Some(handler) = handler {
+                            // Run handler on a blocking thread — tool impls (e.g. Starlark eval)
+                            // may be CPU-bound and must not block the async executor.
+                            let args = req.arguments;
+                            tokio::task::spawn_blocking(move || handler(args))
+                                .await
+                                .unwrap_or_else(|e| ToolResult::failure(format!("Tool panicked: {e}")))
                         } else {
                             ToolResult {
                                 text_result_for_llm: format!(
@@ -120,7 +131,7 @@ impl Session {
                         };
 
                         let result = if approved {
-                            eprintln!("     ✓ Approved");
+                            eprintln!("     \x1b[32m✓\x1b[0m Approved");
                             PermissionResult::approve()
                         } else {
                             eprintln!("     ✗ Denied");

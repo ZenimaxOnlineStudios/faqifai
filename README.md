@@ -24,7 +24,7 @@ cargo install --path .
 Create a `.faq` file in your repository root:
 
 ```toml
-ttl = "7d"
+ttl = "90d"
 output = "faq.md"
 scope = "src/**"
 context = "This is a Rust web server using Axum."

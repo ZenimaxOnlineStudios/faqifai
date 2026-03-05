@@ -10,9 +10,6 @@ use crate::copilot::{
 use crate::eval;
 use crate::codebase;
 
-/// Sentinel response the AI returns when a previous answer is still accurate
-const NO_UPDATE_SENTINEL: &str = "NO_UPDATE_NEEDED";
-
 /// System prompt: instructs the AI on how to answer codebase questions.
 /// The `{output_dir}` placeholder is replaced at runtime with the output file's
 /// directory relative to the repo root, so the AI can write correct relative paths.
@@ -46,7 +43,7 @@ const SYSTEM_PROMPT: &str = r#"You are a codebase research agent generating refe
 
 6. **Output only the answer body.** Do not include the question as a heading (the tool adds headings). Do not add frontmatter, preamble, or sign-off. Start directly with the content. NEVER write sentences like "I have all the information I need", "Let me create the answer", "Perfect!", or any other meta-commentary — your first character of output must be part of the actual answer.
 
-7. **When a previous answer is provided,** use it as a research accelerator — it tells you what was previously found and how the answer was structured. Verify its claims against the current source code, especially for any files flagged as changed. Keep what is still accurate, update what has changed, and remove anything no longer true. Do not mention that you are updating a previous answer. **If after thorough verification the previous answer is still fully accurate and complete, respond with exactly `NO_UPDATE_NEEDED` (nothing else).** Only use this when you are confident nothing has changed.
+7. **When a previous answer is provided,** use it as a research accelerator — it tells you what was previously found and how the answer was structured. Verify its claims against the current source code, especially for any files flagged as changed. Keep what is still accurate, update what has changed, and remove anything no longer true. Do not mention that you are updating a previous answer. **If after thorough verification the previous answer is still fully accurate and complete, call the `mark_unchanged` tool (no arguments) and output nothing else.** Only use `mark_unchanged` when you are confident nothing has changed.
 
 8. **At the very end of your answer, append a sources block** listing every file you actually read that was relevant to the answer. This is used to detect when the answer needs regenerating — be precise. Format:
    ```
@@ -263,6 +260,15 @@ fn tool_definitions() -> Vec<ToolDefinition> {
             })),
             overrides_built_in_tool: None,
         },
+        ToolDefinition {
+            name: "mark_unchanged".to_string(),
+            description: Some("Signal that the previous answer is still fully accurate after verification. Call this (with no arguments) instead of rewriting the answer. Only use when you have verified all source files and are confident nothing has changed.".to_string()),
+            parameters: Some(serde_json::json!({
+                "type": "object",
+                "properties": {}
+            })),
+            overrides_built_in_tool: None,
+        },
     ]
 }
 
@@ -306,6 +312,9 @@ pub async fn answer_question(
 
     let working_dir = root.to_string_lossy().replace('\\', "/");
 
+    // Shared flag set by the mark_unchanged tool call
+    let unchanged_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
     // Create a session with read-only built-in tools + our custom eval tool
     let session = client
         .create_session(SessionConfig {
@@ -322,7 +331,7 @@ pub async fn answer_question(
         .await?;
 
     // Register custom tool handlers (only eval — read tools are built into copilot)
-    register_tools(&session, root).await;
+    register_tools(&session, root, unchanged_flag.clone()).await;
 
     // Send the question and wait for the complete response
     let answer = session.send_and_wait(&user_message).await?;
@@ -332,17 +341,17 @@ pub async fn answer_question(
         tracing::warn!("Failed to destroy session: {}", e);
     }
 
-    // If the AI says nothing changed, reuse the previous answer
-    let answer = if answer.trim() == NO_UPDATE_SENTINEL {
+    // If the AI called mark_unchanged, reuse the previous answer
+    let answer = if unchanged_flag.load(std::sync::atomic::Ordering::Relaxed) {
         if let Some(prev) = &input.previous_answer {
-            eprintln!("✓ No update needed: {}", input.question);
+            eprintln!("\x1b[32m✓\x1b[0m No update needed: {}", input.question);
             prev.clone()
         } else {
-            tracing::warn!("AI returned NO_UPDATE_NEEDED but no previous answer exists for '{}'; treating as empty", input.question);
+            tracing::warn!("AI called mark_unchanged but no previous answer exists for '{}'; treating as empty", input.question);
             answer
         }
     } else {
-        eprintln!("✓ Answered ({} bytes): {}", answer.len(), input.question);
+        eprintln!("\x1b[32m✓\x1b[0m Answered ({} bytes): {}", answer.len(), input.question);
         answer
     };
 
@@ -378,6 +387,7 @@ pub async fn answer_question(
 async fn register_tools(
     session: &Session,
     root: &Path,
+    unchanged_flag: Arc<std::sync::atomic::AtomicBool>,
 ) {
     let r = root.to_path_buf();
     session
@@ -389,6 +399,16 @@ async fn register_tools(
                     Ok(result) => ToolResult::success(result),
                     Err(e) => ToolResult::failure(e.to_string()),
                 }
+            }),
+        )
+        .await;
+
+    session
+        .register_tool(
+            "mark_unchanged",
+            Arc::new(move |_args| {
+                unchanged_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                ToolResult::success("Marked as unchanged.".to_string())
             }),
         )
         .await;
