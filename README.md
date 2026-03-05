@@ -6,9 +6,10 @@ AI-powered FAQ generator for codebases. Write questions in `.faq` files, and faq
 
 1. You create `.faq` files (TOML) anywhere in your repository with questions about the codebase
 2. `faqifai run` discovers them, checks which answers are stale or missing, and spawns AI sessions to answer them
-3. Each session uses Copilot's built-in tools (file reading, search, grep) plus a sandboxed Starlark scripting engine to thoroughly research the codebase
-4. Answers are written to markdown files with YAML frontmatter tracking source file hashes and generation timestamps
-5. On subsequent runs, only stale answers are regenerated — controlled by TTL expiry and source file change detection
+3. Each session uses Copilot's built-in tools (file reading, search, grep) plus a sandboxed Starlark scripting tool (`analyze`) for multi-step analysis in a single call
+4. Answers are written to markdown files with a human-readable table of contents, YAML frontmatter, and relative file links
+5. The AI reports which files it used — only those specific files are hashed for change detection, so reruns are cheap
+6. On subsequent runs, only stale answers are regenerated — controlled by TTL expiry and source file change detection
 
 ## Installation
 
@@ -43,26 +44,28 @@ Then run:
 faqifai run
 ```
 
+All paths in `.faq` files are relative to the `.faq` file's location. The codebase root is the directory where you invoke `faqifai`.
+
 ## FAQ file format
 
 `.faq` files use TOML with top-level defaults and per-question overrides:
 
-| Field     | Level        | Description                                          |
-|-----------|--------------|------------------------------------------------------|
-| `output`  | top / question | Path to output markdown file (required)            |
-| `ttl`     | top / question | Regeneration interval (`7d`, `24h`, `30m`)         |
-| `scope`   | top / question | Glob pattern for source files to include as context |
-| `context` | top / question | Free-text context given to the AI                  |
-| `hints`   | question only  | File paths the AI should prioritize reading        |
+| Field     | Level          | Description                                          |
+|-----------|----------------|------------------------------------------------------|
+| `output`  | top / question | Path to output markdown file (required)              |
+| `ttl`     | top / question | Regeneration interval (`7d`, `24h`, `30m`)           |
+| `scope`   | top / question | Glob pattern for source files to watch for changes   |
+| `context` | top / question | Free-text context given to the AI                    |
+| `hints`   | question only  | File paths the AI should prioritize reading          |
 
 Per-question fields override top-level defaults. Context fields are concatenated.
 
 ## Commands
 
 ```
-faqifai run [--force] [--path DIR] [--concurrency N]
+faqifai run [--force] [--path DIR] [--concurrency N] [--model MODEL]
 ```
-Generate or regenerate FAQ answers. `--force` ignores TTL and hash state. Default concurrency is 4 parallel sessions.
+Generate or regenerate FAQ answers. `--force` ignores TTL and hash state. Default concurrency is 4 parallel sessions. Default model is `claude-sonnet-4.6`.
 
 ```
 faqifai status [--path DIR]
@@ -90,39 +93,51 @@ An answer is regenerated when any of these conditions is met:
 
 - **Never generated** — question exists in `.faq` but no answer in the output file
 - **TTL expired** — the `generated_at` timestamp plus the TTL has passed
-- **Sources changed** — SHA-256 hashes of source files tracked in the YAML frontmatter differ from current disk state
+- **Sources changed** — the AI-reported source files have changed since last generation (SHA-256 / merkle hashes)
 - **Force flag** — `--force` regenerates everything unconditionally
+
+When regenerating, the previous answer and the list of previously-tracked source files are passed to the AI so it can update efficiently rather than starting from scratch.
+
+The staleness reason is printed before each question runs:
+```
+⚡ Stale (sources changed: src/auth/mod.rs): How does authentication work?
+```
 
 ## Output format
 
-Generated markdown files have YAML frontmatter with a table of contents, per-question generation timestamps, and source file SHA-256 hashes for change detection:
+Generated markdown files include a human-readable table of contents at the top, followed by answers as `#`-headed sections:
 
-```yaml
+```markdown
+## Contents
+
+- [How does authentication work?](#how-does-authentication-work)
+- [What database migrations exist?](#what-database-migrations-exist)
+
 ---
-generated_by: faqifai
-source: project.faq
-toc:
-- question: How does authentication work?
-  anchor: '#how-does-authentication-work'
-  generated_at: 2026-03-05T17:04:59Z
-  sources:
-  - path: src/auth/mod.rs
-    sha256: abc123...
----
+
+# How does authentication work?
+
+...answer...
 ```
 
-Answer bodies use sub-headings, code blocks, and relative file path links for traceability.
+The YAML frontmatter (hidden from most markdown viewers) stores per-question generation timestamps and source file hashes for staleness tracking.
 
-## Starlark eval tool
+File references in answers are relative markdown links pointing back to the source, e.g. `[auth/mod.rs:42](./src/auth/mod.rs#L42)`.
 
-In addition to Copilot's built-in file tools, faqifai provides an `eval` tool that executes sandboxed [Starlark](https://github.com/bazelbuild/starlark) scripts. This lets the AI do multi-step analysis (parse configs, cross-reference symbols, aggregate data) in a single tool call. The sandbox provides file I/O, regex, and JSON/TOML parsing — but no network access, no shell execution, and no write operations.
+## Analyze tool
+
+In addition to Copilot's built-in file tools, faqifai provides an `analyze` tool that executes sandboxed [Starlark](https://github.com/bazelbuild/starlark) scripts. This lets the AI do multi-step analysis — parse configs, cross-reference symbols, aggregate data — in a single call instead of many sequential reads.
+
+Available built-ins: `read_file`, `read_file_lines`, `find_files`, `list_dir`, `grep`, `lines`, `regex_find`, `regex_match`, `json_parse`, `toml_parse`.
+
+The sandbox is read-only with no network access and no shell execution. All paths are scoped to the workspace root.
 
 ## Security
 
 - Write tools (`edit_file`, `create_file`, `delete_file`) are excluded from AI sessions
 - `run_command` requires interactive user approval before execution
 - The Starlark sandbox is read-only with no network or shell access
-- All file operations are scoped to the workspace root
+- All file operations are scoped to the workspace root via path validation and symlink checks
 
 ## Development
 
