@@ -31,7 +31,7 @@ impl Session {
         transport
             .set_request_handler(
                 "tool.call",
-                Box::new(move |params: Value| {
+                Arc::new(move |params: Value| {
                     let handlers = handlers_clone.clone();
                     Box::pin(async move {
                         let req: ToolCallRequest = serde_json::from_value(params)
@@ -86,59 +86,13 @@ impl Session {
             )
             .await;
 
-        // Interactive permission handler — prompts the user for approval
+        // Permission handler: auto-approve (non-interactive; v3 uses permission.requested events instead)
         transport
             .set_request_handler(
                 "permission.request",
-                Box::new(|params: Value| {
+                Arc::new(|_params: Value| {
                     Box::pin(async move {
-                        // Extract details about the permission request
-                        let request = params.get("permissionRequest")
-                            .or_else(|| params.get("request"))
-                            .cloned()
-                            .unwrap_or(params.clone());
-
-                        let tool_name = request.get("toolName")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("unknown");
-                        let input = request.get("input")
-                            .and_then(|v| v.as_str())
-                            .or_else(|| request.get("arguments").and_then(|v| v.as_str()))
-                            .unwrap_or("");
-                        let description = request.get("description")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("");
-
-                        // Display what's being requested
-                        if !description.is_empty() {
-                            eprintln!("  🔐 Permission: {} — {}", tool_name, description);
-                        } else if !input.is_empty() {
-                            let summary = if input.len() > 120 { &input[..120] } else { input };
-                            eprintln!("  🔐 Permission: {} — {}", tool_name, summary);
-                        } else {
-                            eprintln!("  🔐 Permission: {} — {:?}",
-                                tool_name,
-                                serde_json::to_string(&request).unwrap_or_default()
-                            );
-                        }
-
-                        // Read y/n from stdin
-                        eprint!("     Allow? [y/N] ");
-                        let mut line = String::new();
-                        let approved = match std::io::stdin().read_line(&mut line) {
-                            Ok(_) => line.trim().eq_ignore_ascii_case("y"),
-                            Err(_) => false,
-                        };
-
-                        let result = if approved {
-                            eprintln!("     \x1b[32m✓\x1b[0m Approved");
-                            PermissionResult::approve()
-                        } else {
-                            eprintln!("     ✗ Denied");
-                            PermissionResult::deny()
-                        };
-
-                        let response = PermissionResponse { result };
+                        let response = PermissionResponse { result: PermissionResult::approve() };
                         Ok(serde_json::to_value(response)?)
                     })
                 }),
@@ -188,6 +142,8 @@ impl Session {
             .await
             .context("Failed to send message")?;
 
+        tracing::debug!("session.send complete, entering event loop for session {}", self.session_id);
+
         // Collect streamed content and wait for completion.
         // We track the latest assistant message — each new `content` field
         // replaces the buffer so intermediate "thinking" messages don't leak
@@ -216,8 +172,13 @@ impl Session {
                 continue;
             }
 
+            tracing::debug!("session event: type={} session={}", notification.event.event_type, self.session_id);
+
             match notification.event.event_type.as_str() {
                 ASSISTANT_MESSAGE => {
+                    tracing::debug!("session event: assistant_message content={} delta={}", 
+                        notification.event.data.content.is_some(),
+                        notification.event.data.delta_content.is_some());
                     if let Some(content) = &notification.event.data.content {
                         // A `content` field signals a new (or replacement) message —
                         // reset the buffer so we don't carry forward previous turns.
@@ -275,6 +236,119 @@ impl Session {
                 }
                 "tool.end" | "tool.result" => {
                     tracing::debug!("  ✓ tool completed");
+                }
+                EXTERNAL_TOOL_REQUESTED => {
+                    // Protocol v3: custom tool call broadcast as session event.
+                    // Extract fields and dispatch, then respond via RPC.
+                    let data = &notification.event.data;
+                    let request_id = data.extra.get("requestId")
+                        .and_then(|v| v.as_str()).map(String::from);
+                    let tool_name = data.tool_name.clone()
+                        .or_else(|| data.extra.get("toolName").and_then(|v| v.as_str()).map(String::from));
+                    let args = data.extra.get("arguments").cloned().unwrap_or(Value::Null);
+
+                    tracing::debug!("external_tool.requested: tool={:?} request_id={:?}", tool_name, request_id);
+
+                    if let (Some(request_id), Some(tool_name)) = (request_id, tool_name) {
+                        // Log immediately (v3 doesn't carry tool name in execution_start/complete)
+                        if tool_name != "mark_unchanged" && tool_name != "report_intent" {
+                            let summary = summarize_tool_args(&tool_name, &data.extra, self.root.as_deref());
+                            if summary.is_empty() {
+                                eprintln!("  ⚙  {}", tool_name);
+                            } else {
+                                eprintln!("  ⚙  {} {}", tool_name, summary);
+                            }
+                        }
+
+                        let handler = {
+                            let handlers = self.tool_handlers.lock().await;
+                            handlers.get(&tool_name).cloned()
+                        };
+
+                        let transport = self.transport.clone();
+                        let session_id = self.session_id.clone();
+
+                        tokio::spawn(async move {
+                            let tool_result = if let Some(handler) = handler {
+                                tokio::task::spawn_blocking(move || handler(args))
+                                    .await
+                                    .unwrap_or_else(|e| ToolResult::failure(format!("Tool panicked: {e}")))
+                            } else {
+                                ToolResult::failure(format!("Unknown tool: {}", tool_name))
+                            };
+
+                            if tool_result.result_type == "failure" {
+                                let err = tool_result.error.as_deref().unwrap_or("unknown error");
+                                let first_line = err.lines().next().unwrap_or(err);
+                                eprintln!("    ✗ {}", first_line);
+                            }
+
+                            let params = if tool_result.result_type == "failure" {
+                                let error_msg = tool_result.error
+                                    .unwrap_or_else(|| tool_result.text_result_for_llm);
+                                serde_json::json!({
+                                    "sessionId": session_id,
+                                    "requestId": request_id,
+                                    "error": error_msg,
+                                })
+                            } else {
+                                serde_json::json!({
+                                    "sessionId": session_id,
+                                    "requestId": request_id,
+                                    "result": tool_result.text_result_for_llm,
+                                })
+                            };
+
+                            if let Err(e) = transport.request("session.tools.handlePendingToolCall", params).await {
+                                tracing::warn!("Failed to submit tool result for '{}': {}", tool_name, e);
+                            }
+                        });
+                    }
+                }
+                "permission.requested" => {
+                    // Protocol v3: permission request broadcast as session event.
+                    // faqifai's own tools are whitelisted; everything else is denied.
+                    const APPROVED_TOOLS: &[&str] = &["faq", "analyze", "tldr",
+                        "record_source", "mark_unchanged"];
+
+                    let data = &notification.event.data;
+                    let request_id = data.extra.get("requestId")
+                        .and_then(|v| v.as_str()).map(String::from);
+
+                    let tool_name = data.extra.get("permissionRequest")
+                        .and_then(|pr| pr.get("toolName").and_then(|v| v.as_str())
+                            .or_else(|| pr.get("kind").and_then(|v| v.as_str())))
+                        .unwrap_or("unknown")
+                        .to_string();
+
+                    let approved = APPROVED_TOOLS.contains(&tool_name.as_str());
+
+                    if approved {
+                        eprintln!("  🔐 Approved: {}", tool_name);
+                    } else {
+                        tracing::warn!("Denying unexpected permission request for tool: {}", tool_name);
+                        eprintln!("  🚫 Denied (not whitelisted): {}", tool_name);
+                    }
+
+                    tracing::debug!("permission.requested: tool={} approved={} request_id={:?}",
+                        tool_name, approved, request_id);
+
+                    if let Some(request_id) = request_id {
+                        let transport = self.transport.clone();
+                        let session_id = self.session_id.clone();
+
+                        tokio::spawn(async move {
+                            let result_kind = if approved { "approved" } else { "denied-interactively-by-user" };
+                            let params = serde_json::json!({
+                                "sessionId": session_id,
+                                "requestId": request_id,
+                                "result": { "kind": result_kind },
+                            });
+                            if let Err(e) = transport.request("session.permissions.handlePendingPermissionRequest", params).await {
+                                tracing::warn!("Failed to send permission response: {}", e);
+                            }
+                        });
+                    }
                 }
                 SESSION_IDLE => {
                     tracing::debug!("Session {} completed ({})", self.session_id, notification.event.event_type);

@@ -8,7 +8,7 @@ use crate::ai::{self, AnswerResult, QuestionInput};
 use crate::codebase;
 use crate::discovery;
 use crate::output;
-use crate::state::{self, Staleness, TocEntry};
+use crate::state::{self, Staleness, SourceFile, TocEntry};
 
 /// Run the FAQ generation pipeline
 pub async fn run(root: &Path, scan_path: &Path, concurrency: usize, force: bool, model: &str) -> Result<()> {
@@ -197,7 +197,7 @@ pub async fn run(root: &Path, scan_path: &Path, concurrency: usize, force: bool,
 
         // Merge existing (fresh) + new answers
         let mut merged_answers: HashMap<String, String> = HashMap::new();
-        let mut merged_sources: HashMap<String, Vec<(String, String)>> = HashMap::new();
+        let mut merged_sources: HashMap<String, Vec<SourceFile>> = HashMap::new();
 
         // Keep fresh answers
         for q in &group.questions {

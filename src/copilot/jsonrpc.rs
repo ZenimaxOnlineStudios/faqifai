@@ -49,7 +49,7 @@ impl std::error::Error for RpcError {}
 
 /// Handler for incoming server→client requests (tool calls, permission requests)
 pub type RequestHandlerFn =
-    Box<dyn Fn(Value) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value>> + Send>> + Send + Sync>;
+    Arc<dyn Fn(Value) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value>> + Send>> + Send + Sync>;
 
 /// The JSON-RPC transport layer
 pub struct Transport {
@@ -233,88 +233,108 @@ async fn read_loop(
         let has_method = raw.get("method").is_some();
         let has_id = raw.get("id").is_some();
 
+        tracing::debug!(
+            "jsonrpc ← {} bytes | method={:?} id={:?}",
+            content_length,
+            raw.get("method").and_then(|v| v.as_str()),
+            raw.get("id")
+        );
+
         if has_method {
             // It's a request or notification from the server
             let method = raw["method"].as_str().unwrap_or("").to_string();
             let params = raw.get("params").cloned().unwrap_or(Value::Null);
 
             if has_id {
-                // Server→client request (e.g., tool.call) — needs a response
+                // Server→client request (e.g., tool.call) — needs a response.
+                // Clone the handler Arc and release the lock immediately so the
+                // read_loop is not blocked while the handler runs. Without this,
+                // the loop cannot drain stdout during handler execution; the
+                // subprocess's stdout pipe fills, it blocks, and our stdin write
+                // also blocks — classic pipe deadlock.
                 let id = raw["id"].clone();
-                let handlers = request_handlers.lock().await;
-                if let Some(handler) = handlers.get(&method) {
-                    let result = handler(params).await;
-                    let response = match result {
-                        Ok(val) => Response {
-                            jsonrpc: "2.0".to_string(),
-                            id: Some(id),
-                            result: Some(val),
-                            error: None,
-                        },
-                        Err(e) => Response {
-                            jsonrpc: "2.0".to_string(),
-                            id: Some(id),
-                            result: None,
-                            error: Some(RpcError {
-                                code: -32603,
-                                message: e.to_string(),
-                                data: None,
-                            }),
-                        },
-                    };
-                    let data = serde_json::to_vec(&response)?;
-                    let header = format!("Content-Length: {}\r\n\r\n", data.len());
-                    let mut stdin_lock = stdin.lock().await;
-                    stdin_lock.write_all(header.as_bytes()).await?;
-                    stdin_lock.write_all(&data).await?;
-                    stdin_lock.flush().await?;
+                let handler = {
+                    let handlers = request_handlers.lock().await;
+                    handlers.get(&method).cloned()
+                };
+                if let Some(handler) = handler {
+                    // Spawn so the read_loop immediately continues reading stdout.
+                    let stdin_clone = stdin.clone();
+                    tracing::debug!("jsonrpc: spawning handler for request method={} id={:?}", method, id);
+                    tokio::spawn(async move {
+                        let result = handler(params).await;
+                        let response = match result {
+                            Ok(val) => Response {
+                                jsonrpc: "2.0".to_string(),
+                                id: Some(id),
+                                result: Some(val),
+                                error: None,
+                            },
+                            Err(e) => Response {
+                                jsonrpc: "2.0".to_string(),
+                                id: Some(id),
+                                result: None,
+                                error: Some(RpcError {
+                                    code: -32603,
+                                    message: e.to_string(),
+                                    data: None,
+                                }),
+                            },
+                        };
+                        if let Ok(data) = serde_json::to_vec(&response) {
+                            let header = format!("Content-Length: {}\r\n\r\n", data.len());
+                            let mut stdin_lock = stdin_clone.lock().await;
+                            let _ = stdin_lock.write_all(header.as_bytes()).await;
+                            let _ = stdin_lock.write_all(&data).await;
+                            let _ = stdin_lock.flush().await;
+                        }
+                    });
                 } else {
                     // No request handler — check if notification subscribers want it.
                     // The copilot CLI sends some "notification-like" methods (e.g. session.event)
                     // as requests with an id. Broadcast to subscribers and ack with null.
-                    let mut subs = notification_subs.lock().await;
-                    let has_subs = if let Some(senders) = subs.get_mut(&method) {
-                        senders.retain(|tx| tx.send(params.clone()).is_ok());
-                        !senders.is_empty()
-                    } else {
-                        false
+                    let has_subs = {
+                        let mut subs = notification_subs.lock().await;
+                        if let Some(senders) = subs.get_mut(&method) {
+                            senders.retain(|tx| tx.send(params.clone()).is_ok());
+                            !senders.is_empty()
+                        } else {
+                            false
+                        }
                     };
-                    drop(subs);
 
-                    if has_subs {
-                        // Acknowledge with null result (like Go SDK's NotificationHandlerFor)
-                        let response = Response {
-                            jsonrpc: "2.0".to_string(),
-                            id: Some(id),
-                            result: Some(Value::Null),
-                            error: None,
+                    // Spawn the ACK write so the read_loop is not blocked by stdin I/O.
+                    let stdin_clone = stdin.clone();
+                    tokio::spawn(async move {
+                        let response = if has_subs {
+                            // Acknowledge with null result (like Go SDK's NotificationHandlerFor)
+                            Response {
+                                jsonrpc: "2.0".to_string(),
+                                id: Some(id),
+                                result: Some(Value::Null),
+                                error: None,
+                            }
+                        } else {
+                            tracing::debug!("No handler for server request: {}", method);
+                            Response {
+                                jsonrpc: "2.0".to_string(),
+                                id: Some(id),
+                                result: None,
+                                error: Some(RpcError {
+                                    code: -32601,
+                                    message: format!("Method not found: {}", method),
+                                    data: None,
+                                }),
+                            }
                         };
-                        let data = serde_json::to_vec(&response)?;
-                        let header = format!("Content-Length: {}\r\n\r\n", data.len());
-                        let mut stdin_lock = stdin.lock().await;
-                        stdin_lock.write_all(header.as_bytes()).await?;
-                        stdin_lock.write_all(&data).await?;
-                        stdin_lock.flush().await?;
-                    } else {
-                        tracing::debug!("No handler for server request: {}", method);
-                        // Send method-not-found error
-                        let response = Response {
-                            jsonrpc: "2.0".to_string(),
-                            id: Some(id),
-                            result: None,
-                            error: Some(RpcError {
-                                code: -32601,
-                                message: format!("Method not found: {}", method),
-                                data: None,
-                            }),
-                        };
-                        let data = serde_json::to_vec(&response)?;
-                        let header = format!("Content-Length: {}\r\n\r\n", data.len());
-                        let mut stdin_lock = stdin.lock().await;
-                        stdin_lock.write_all(header.as_bytes()).await?;
-                        stdin_lock.write_all(&data).await?;
-                        stdin_lock.flush().await?;
-                    }
+                        if let Ok(data) = serde_json::to_vec(&response) {
+                            let header = format!("Content-Length: {}\r\n\r\n", data.len());
+                            let mut stdin_lock = stdin_clone.lock().await;
+                            let _ = stdin_lock.write_all(header.as_bytes()).await;
+                            let _ = stdin_lock.write_all(&data).await;
+                            let _ = stdin_lock.flush().await;
+                        }
+                    });
                 }
             } else {
                 // Notification — broadcast to all subscribers

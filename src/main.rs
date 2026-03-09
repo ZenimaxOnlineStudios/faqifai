@@ -19,6 +19,10 @@ and writes terse sourced markdown answers. Answers are cached and only regenerat
 files change or the TTL expires."
 )]
 struct Cli {
+    /// Enable verbose debug logging (shows JSON-RPC events, tool calls, session lifecycle)
+    #[arg(short, long, global = true)]
+    verbose: bool,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -96,7 +100,17 @@ enum OutputFormat {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt::init();
+    let cli = Cli::parse();
+
+    // Verbose flag enables DEBUG; default shows only WARN+
+    let level = if cli.verbose { "debug" } else { "warn" };
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(level)),
+        )
+        .with_writer(std::io::stderr)
+        .init();
 
     let cli = Cli::parse();
     let root = std::env::current_dir()?;

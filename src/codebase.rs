@@ -233,7 +233,88 @@ pub fn hash_source_cached(root: &Path, source: &str, cache: &mut std::collection
     Ok(hash)
 }
 
-/// Read specific line range from a file (1-indexed, inclusive)
+/// Hash a specific line range in a file (1-indexed, inclusive).
+/// Returns `(sha256, content_len_in_bytes)` where `content_len` is the byte length
+/// of the joined lines (joined with `\n`). Used for line-range source tracking.
+pub fn hash_file_lines(root: &Path, relative_path: &str, start: u32, end: u32) -> Result<(String, u64)> {
+    let full_path = safe_join(root, relative_path)?;
+    let content = std::fs::read_to_string(&full_path)?;
+    let lines: Vec<&str> = content.lines().collect();
+    let total = lines.len();
+    let start_idx = (start as usize).saturating_sub(1).min(total);
+    let end_idx = (end as usize).min(total);
+    let block = lines[start_idx..end_idx].join("\n");
+    let len = block.len() as u64;
+    Ok((sha256_hex(&block), len))
+}
+
+/// Check whether a line-range source is still fresh, using content-following logic.
+///
+/// Returns `true` (fresh) if:
+/// - The same line range still hashes to `stored_hash`, OR
+/// - A window of the same `content_len` bytes (at any line boundary) hashes to `stored_hash`
+///   (meaning the content moved but is otherwise unchanged).
+///
+/// Returns `false` (stale) if the content cannot be found anywhere in the file.
+pub fn check_line_range_staleness(
+    root: &Path,
+    relative_path: &str,
+    start: u32,
+    end: u32,
+    content_len: u64,
+    stored_hash: &str,
+) -> Result<bool> {
+    let full_path = safe_join(root, relative_path)?;
+    let content = std::fs::read_to_string(&full_path)?;
+    let lines: Vec<&str> = content.lines().collect();
+    let total = lines.len();
+    let line_count = (end as usize).saturating_sub((start as usize).saturating_sub(1));
+
+    // Fast path: re-hash the original range
+    let start_idx = (start as usize).saturating_sub(1).min(total);
+    let end_idx = (end as usize).min(total);
+    let original_block = lines[start_idx..end_idx].join("\n");
+    if sha256_hex(&original_block) == stored_hash {
+        return Ok(true);
+    }
+
+    // Content changed at the original position — scan for it elsewhere.
+    // Build cumulative byte lengths per line boundary so we can filter candidates
+    // by byte span without hashing every window.
+    if line_count == 0 || line_count > total {
+        return Ok(false);
+    }
+
+    // cumulative[i] = total bytes of lines[0..i].join("\n")
+    let mut cumulative: Vec<u64> = Vec::with_capacity(total + 1);
+    cumulative.push(0);
+    for (i, line) in lines.iter().enumerate() {
+        let prev = cumulative[i];
+        // Each line contributes line.len() bytes; lines are joined with "\n" (1 byte between each)
+        let added = line.len() as u64 + if i > 0 { 1 } else { 0 };
+        cumulative.push(prev + added);
+    }
+
+    for window_start in 0..=(total - line_count) {
+        let window_end = window_start + line_count;
+        // Byte span of lines[window_start..window_end].join("\n")
+        // = sum of line lengths + (line_count - 1) separator bytes
+        let line_bytes: u64 = lines[window_start..window_end].iter().map(|l| l.len() as u64).sum();
+        let sep_bytes = (line_count as u64).saturating_sub(1);
+        let span = line_bytes + sep_bytes;
+
+        if span == content_len {
+            let block = lines[window_start..window_end].join("\n");
+            if sha256_hex(&block) == stored_hash {
+                return Ok(true);
+            }
+        }
+    }
+
+    Ok(false)
+}
+
+
 pub fn read_file_lines(
     root: &Path,
     relative_path: &str,

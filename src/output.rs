@@ -28,7 +28,7 @@ pub fn write_output(
     source_faq_path: &str,
     questions: &[String],
     answers: &HashMap<String, String>,
-    sources: &HashMap<String, Vec<(String, String)>>,
+    sources: &HashMap<String, Vec<SourceFile>>,
     existing_toc: &[TocEntry],
 ) -> Result<()> {
     let now = Utc::now();
@@ -46,13 +46,7 @@ pub fn write_output(
                     question: question.clone(),
                     anchor,
                     generated_at: now,
-                    sources: sources[question]
-                        .iter()
-                        .map(|(path, hash)| SourceFile {
-                            path: path.clone(),
-                            sha256: hash.clone(),
-                        })
-                        .collect(),
+                    sources: sources[question].clone(),
                 }
             } else {
                 // Fresh — keep existing metadata
@@ -64,17 +58,7 @@ pub fn write_output(
                 question: question.clone(),
                 anchor,
                 generated_at: now,
-                sources: sources
-                    .get(question)
-                    .map(|s| {
-                        s.iter()
-                            .map(|(path, hash)| SourceFile {
-                                path: path.clone(),
-                                sha256: hash.clone(),
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default(),
+                sources: sources.get(question).cloned().unwrap_or_default(),
             }
         };
 

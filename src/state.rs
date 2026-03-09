@@ -24,11 +24,23 @@ pub struct TocEntry {
     pub sources: Vec<SourceFile>,
 }
 
+/// A specific line range within a source file
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct LineRange {
+    pub start: u32,
+    pub end: u32,
+    /// Byte length of the extracted block at recording time, used for fast candidate filtering
+    pub content_len: u64,
+}
+
 /// A source file with its hash at generation time
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct SourceFile {
     pub path: String,
     pub sha256: String,
+    /// If set, only this line range was tracked (rather than the whole file)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lines: Option<LineRange>,
 }
 
 /// Staleness result for a single question
@@ -131,15 +143,30 @@ pub fn check_staleness(
     // Check source hashes
     let mut changed = Vec::new();
     for source in &entry.sources {
-        match codebase::hash_source_cached(root, &source.path, cache) {
-            Ok(current_hash) => {
-                if current_hash != source.sha256 {
+        if let Some(ref range) = source.lines {
+            match codebase::check_line_range_staleness(
+                root,
+                &source.path,
+                range.start,
+                range.end,
+                range.content_len,
+                &source.sha256,
+            ) {
+                Ok(true) => {}
+                Ok(false) => changed.push(source.path.clone()),
+                Err(_) => changed.push(source.path.clone()),
+            }
+        } else {
+            match codebase::hash_source_cached(root, &source.path, cache) {
+                Ok(current_hash) => {
+                    if current_hash != source.sha256 {
+                        changed.push(source.path.clone());
+                    }
+                }
+                Err(_) => {
+                    // File was deleted or became unreadable
                     changed.push(source.path.clone());
                 }
-            }
-            Err(_) => {
-                // File was deleted or became unreadable
-                changed.push(source.path.clone());
             }
         }
     }

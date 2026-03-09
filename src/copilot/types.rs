@@ -229,4 +229,7 @@ pub struct ModelInfo {
 }
 
 /// SDK protocol version — must match the server
-pub const SDK_PROTOCOL_VERSION: i32 = 2;
+pub const SDK_PROTOCOL_VERSION: i32 = 3;
+
+/// v3 broadcast event: custom tool invoked (we must respond via session.tools.handlePendingToolCall)
+pub const EXTERNAL_TOOL_REQUESTED: &str = "external_tool.requested";

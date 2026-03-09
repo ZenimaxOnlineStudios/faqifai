@@ -9,6 +9,44 @@ use crate::copilot::{
 };
 use crate::eval;
 use crate::codebase;
+use crate::state::{LineRange, SourceFile};
+
+/// A source file path (and optional line range) recorded by the AI during a session
+struct RecordedSource {
+    path: String,
+    start_line: Option<u32>,
+    end_line: Option<u32>,
+}
+
+/// Shared state for tracking mark_unchanged signals within a session
+struct SessionSharedState {
+    current_question: Arc<std::sync::Mutex<Option<String>>>,
+    unchanged_set: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    recorded_sources: Arc<std::sync::Mutex<Vec<RecordedSource>>>,
+}
+
+impl SessionSharedState {
+    fn new() -> Self {
+        Self {
+            current_question: Arc::new(std::sync::Mutex::new(None)),
+            unchanged_set: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            recorded_sources: Arc::new(std::sync::Mutex::new(Vec::new())),
+        }
+    }
+
+    fn set_current(&self, question: &str) {
+        *self.current_question.lock().unwrap() = Some(question.to_string());
+        self.recorded_sources.lock().unwrap().clear();
+    }
+
+    fn is_unchanged(&self, question: &str) -> bool {
+        self.unchanged_set.lock().unwrap().contains(question)
+    }
+
+    fn drain_sources(&self) -> Vec<RecordedSource> {
+        std::mem::take(&mut *self.recorded_sources.lock().unwrap())
+    }
+}
 
 /// System prompt: instructs the AI on how to answer codebase questions.
 /// The `{output_dir}` placeholder is replaced at runtime with the output file's
@@ -37,6 +75,7 @@ const SYSTEM_PROMPT: &str = r#"You are a codebase research agent generating refe
    - Read files to understand implementations, or request specific line ranges for large files
    - **Use `analyze` instead of making 3 or more sequential read/grep tool calls.** If you need to read multiple files, cross-reference data, aggregate results, or parse structured files (TOML, JSON), write an `analyze` script to do it in one call. This is faster and cheaper than chained tool calls.
    - Follow imports and references — trace the complete call chain before answering
+   - **In a multi-question session, build on your prior research.** Files already read are in your context — don't re-read them unless you need a specific line range or the content may have changed.
    It is better to make too many tool calls than to guess.
 
 5. **Structure for scanability.** Use sub-headings, bullet points, and code blocks. Lead with the direct answer, then expand with supporting detail. Keep prose minimal — prefer structured content over paragraphs.
@@ -45,15 +84,10 @@ const SYSTEM_PROMPT: &str = r#"You are a codebase research agent generating refe
 
 7. **When a previous answer is provided,** use it as a research accelerator — it tells you what was previously found and how the answer was structured. Verify its claims against the current source code, especially for any files flagged as changed. Keep what is still accurate, update what has changed, and remove anything no longer true. Do not mention that you are updating a previous answer. **If after thorough verification the previous answer is still fully accurate and complete, call the `mark_unchanged` tool (no arguments) and output nothing else.** Only use `mark_unchanged` when you are confident nothing has changed.
 
-8. **At the very end of your answer, append a sources block** listing every file you actually read that was relevant to the answer. This is used to detect when the answer needs regenerating — be precise. Format:
-   ```
-   <!-- faqifai-sources
-   src/path/to/file.rs
-   src/path/to/other.rs
-   -->
-   ```
-   - List individual files, not directories, unless you genuinely believe *new unread files* being added to a directory would change the answer (in which case list the directory as `src/some/dir/`)
-   - Use paths relative to the workspace root
+8. **Track your sources by calling `record_source`.** After reading any file that materially influenced your answer, call `record_source` with its path (relative to the workspace root). This is used to detect when the answer needs regenerating — be precise.
+   - Use paths relative to the workspace root (e.g. `src/auth.rs`)
+   - Use a trailing slash for directories when you want any new file added to that directory to trigger regeneration (e.g. `src/some/dir/`)
+   - To track only a specific range of lines (e.g. one function), pass `start_line` and `end_line` — staleness checking will follow the content even if it moves to a different position
    - Include only files that materially influenced the answer — not every file you glanced at
 
 ## Starlark scripting reference (for the `analyze` tool)
@@ -131,28 +165,10 @@ dev = list(pkg.get("devDependencies", {}).keys())
 pub struct AnswerResult {
     pub question: String,
     pub answer: String,
-    pub sources: Vec<(String, String)>, // (path, sha256)
+    pub sources: Vec<SourceFile>,
 }
 
-/// Parse and strip the `<!-- faqifai-sources ... -->` block from the AI answer.
-/// Returns (cleaned_answer, list_of_source_paths).
-fn extract_ai_sources(answer: &str) -> (String, Vec<String>) {
-    let marker_start = "<!-- faqifai-sources";
-    let marker_end = "-->";
-    if let Some(start) = answer.rfind(marker_start) {
-        if let Some(rel_end) = answer[start..].find(marker_end) {
-            let block = &answer[start + marker_start.len()..start + rel_end];
-            let sources: Vec<String> = block
-                .lines()
-                .map(|l| l.trim().to_string())
-                .filter(|l| !l.is_empty())
-                .collect();
-            let cleaned = answer[..start].trim_end().to_string();
-            return (cleaned, sources);
-        }
-    }
-    (answer.to_string(), Vec::new())
-}
+
 
 
 /// E.g., if output is "docs/api/auth.md", returns "../../" so that
@@ -218,7 +234,7 @@ fn build_user_message(
 
             if let Some(srcs) = previous_sources {
                 if !srcs.is_empty() {
-                    msg.push_str("**Files previously tracked as relevant** (update this list in your sources block — add files you found relevant, remove ones that no longer apply):\n");
+                    msg.push_str("**Files previously tracked as relevant** (call `record_source` for each that remains relevant — add new findings, omit any that no longer apply):\n");
                     for s in srcs {
                         msg.push_str(&format!("- `{}`\n", s));
                     }
@@ -269,6 +285,29 @@ fn tool_definitions() -> Vec<ToolDefinition> {
             })),
             overrides_built_in_tool: None,
         },
+        ToolDefinition {
+            name: "record_source".to_string(),
+            description: Some("Record a source file (or a specific line range within a file) as relevant to the current answer. Call this for every file you read that materially influenced the answer. Staleness detection uses these records to decide when to regenerate the answer.".to_string()),
+            parameters: Some(serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "File path relative to workspace root (e.g. \"src/auth.rs\"). Use a trailing slash for directories."
+                    },
+                    "start_line": {
+                        "type": "integer",
+                        "description": "First line of the relevant range (1-indexed, inclusive). Omit to track the whole file."
+                    },
+                    "end_line": {
+                        "type": "integer",
+                        "description": "Last line of the relevant range (1-indexed, inclusive). Required if start_line is provided."
+                    }
+                },
+                "required": ["path"]
+            })),
+            overrides_built_in_tool: None,
+        },
     ]
 }
 
@@ -285,6 +324,7 @@ fn excluded_tools() -> Vec<String> {
 }
 
 /// Answer a single question using the Copilot SDK
+#[allow(dead_code)]
 pub async fn answer_question(
     root: &Path,
     input: &QuestionInput,
@@ -312,8 +352,7 @@ pub async fn answer_question(
 
     let working_dir = root.to_string_lossy().replace('\\', "/");
 
-    // Shared flag set by the mark_unchanged tool call
-    let unchanged_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let shared = SessionSharedState::new();
 
     // Create a session with read-only built-in tools + our custom eval tool
     let session = client
@@ -330,8 +369,10 @@ pub async fn answer_question(
         })
         .await?;
 
-    // Register custom tool handlers (only eval — read tools are built into copilot)
-    register_tools(&session, root, unchanged_flag.clone()).await;
+    // Register custom tool handlers (only analyze — read tools are built into copilot)
+    register_tools(&session, root, &shared).await;
+
+    shared.set_current(&input.question);
 
     // Send the question and wait for the complete response
     let answer = session.send_and_wait(&user_message).await?;
@@ -342,7 +383,7 @@ pub async fn answer_question(
     }
 
     // If the AI called mark_unchanged, reuse the previous answer
-    let answer = if unchanged_flag.load(std::sync::atomic::Ordering::Relaxed) {
+    let answer = if shared.is_unchanged(&input.question) {
         if let Some(prev) = &input.previous_answer {
             eprintln!("\x1b[32m✓\x1b[0m No update needed: {}", input.question);
             prev.clone()
@@ -357,24 +398,8 @@ pub async fn answer_question(
 
     // Extract AI-reported sources from the answer block and use them for staleness tracking.
     // Fall back to the pre-computed scope/hints hashes if the AI didn't report sources.
-    let (answer, final_sources) = {
-        let (cleaned, ai_source_paths) = extract_ai_sources(&answer);
-        let source_map = if !ai_source_paths.is_empty() {
-            let mut map = std::collections::HashMap::new();
-            for path in &ai_source_paths {
-                match codebase::hash_source(root, path) {
-                    Ok(hash) => { map.insert(path.clone(), hash); }
-                    Err(e) => tracing::warn!("Could not hash AI-reported source '{}': {}", path, e),
-                }
-            }
-            map
-        } else {
-            sources
-        };
-        let mut vec: Vec<(String, String)> = source_map.into_iter().collect();
-        vec.sort_by(|a, b| a.0.cmp(&b.0));
-        (cleaned, vec)
-    };
+    let recorded = shared.drain_sources();
+    let final_sources = resolve_recorded_sources(root, recorded, sources);
 
     Ok(AnswerResult {
         question: input.question.clone(),
@@ -387,7 +412,7 @@ pub async fn answer_question(
 async fn register_tools(
     session: &Session,
     root: &Path,
-    unchanged_flag: Arc<std::sync::atomic::AtomicBool>,
+    shared: &SessionSharedState,
 ) {
     let r = root.to_path_buf();
     session
@@ -403,12 +428,37 @@ async fn register_tools(
         )
         .await;
 
+    let unchanged_set = shared.unchanged_set.clone();
+    let current_question = shared.current_question.clone();
     session
         .register_tool(
             "mark_unchanged",
             Arc::new(move |_args| {
-                unchanged_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                if let Some(ref q) = *current_question.lock().unwrap() {
+                    unchanged_set.lock().unwrap().insert(q.clone());
+                }
                 ToolResult::success("Marked as unchanged.".to_string())
+            }),
+        )
+        .await;
+
+    let recorded_sources = shared.recorded_sources.clone();
+    session
+        .register_tool(
+            "record_source",
+            Arc::new(move |args| {
+                let path = arg_str(&args, "path");
+                if path.is_empty() {
+                    return ToolResult::failure("path is required".to_string());
+                }
+                let start_line = arg_u32(&args, "start_line");
+                let end_line = arg_u32(&args, "end_line");
+                recorded_sources.lock().unwrap().push(RecordedSource {
+                    path,
+                    start_line,
+                    end_line,
+                });
+                ToolResult::success("Source recorded.".to_string())
             }),
         )
         .await;
@@ -420,6 +470,59 @@ fn arg_str(args: &serde_json::Value, key: &str) -> String {
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string()
+}
+
+/// Extract an optional u32 argument
+fn arg_u32(args: &serde_json::Value, key: &str) -> Option<u32> {
+    args.get(key).and_then(|v| v.as_u64()).map(|v| v as u32)
+}
+
+/// Hash recorded sources into `SourceFile` entries for staleness tracking.
+/// Falls back to pre-computed `fallback` hashes if no sources were recorded.
+fn resolve_recorded_sources(
+    root: &Path,
+    mut recorded: Vec<RecordedSource>,
+    fallback: HashMap<String, String>,
+) -> Vec<SourceFile> {
+    if recorded.is_empty() {
+        let mut sources: Vec<SourceFile> = fallback
+            .into_iter()
+            .map(|(path, sha256)| SourceFile { path, sha256, lines: None })
+            .collect();
+        sources.sort_by(|a, b| a.path.cmp(&b.path));
+        return sources;
+    }
+
+    // Deduplicate by (path, start_line, end_line) — keep last occurrence
+    recorded.reverse();
+    let mut seen = std::collections::HashSet::new();
+    recorded.retain(|r| seen.insert((r.path.clone(), r.start_line, r.end_line)));
+    recorded.reverse();
+
+    let mut sources = Vec::new();
+    for rec in &recorded {
+        if let (Some(start), Some(end)) = (rec.start_line, rec.end_line) {
+            match codebase::hash_file_lines(root, &rec.path, start, end) {
+                Ok((hash, content_len)) => sources.push(SourceFile {
+                    path: rec.path.clone(),
+                    sha256: hash,
+                    lines: Some(LineRange { start, end, content_len }),
+                }),
+                Err(e) => tracing::warn!("Could not hash line range for '{}': {}", rec.path, e),
+            }
+        } else {
+            match codebase::hash_source(root, &rec.path) {
+                Ok(hash) => sources.push(SourceFile {
+                    path: rec.path.clone(),
+                    sha256: hash,
+                    lines: None,
+                }),
+                Err(e) => tracing::warn!("Could not hash source '{}': {}", rec.path, e),
+            }
+        }
+    }
+    sources.sort_by(|a, b| a.path.cmp(&b.path));
+    sources
 }
 
 /// Input for a single question to be answered concurrently
@@ -435,34 +538,149 @@ pub struct QuestionInput {
     pub changed_sources: Option<Vec<String>>,
 }
 
+/// Answer multiple questions sequentially in a single session.
+/// All inputs must share the same output_path.
+/// The session retains file context across questions — loaded files stay in context.
+async fn answer_questions_in_session(
+    root: &Path,
+    inputs: &[QuestionInput],
+    client: &Client,
+    model: &str,
+) -> Vec<Result<AnswerResult>> {
+    // All questions share the same output_path
+    let output_path = &inputs[0].output_path;
+    let system_prompt = build_system_prompt(output_path);
+    let working_dir = root.to_string_lossy().replace('\\', "/");
+
+    let shared = SessionSharedState::new();
+
+    let session = match client
+        .create_session(SessionConfig {
+            model: Some(model.to_string()),
+            system_message: Some(SystemMessageConfig {
+                mode: "replace".to_string(),
+                content: system_prompt,
+            }),
+            tools: Some(tool_definitions()),
+            excluded_tools: Some(excluded_tools()),
+            working_directory: Some(working_dir),
+            ..Default::default()
+        })
+        .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            return inputs
+                .iter()
+                .map(|_| Err(anyhow::anyhow!("Session creation failed: {}", e)))
+                .collect()
+        }
+    };
+
+    register_tools(&session, root, &shared).await;
+
+    let mut results = Vec::new();
+
+    for input in inputs {
+        shared.set_current(&input.question);
+        eprintln!("▶ Answering: {}", input.question);
+
+        let previous_source_paths: Vec<String> = input.source_hashes.keys().cloned().collect();
+        let user_message = build_user_message(
+            &input.question,
+            input.context.as_deref(),
+            input.hints.as_deref(),
+            input.previous_answer.as_deref(),
+            input.changed_sources.as_deref(),
+            if input.previous_answer.is_some() && !previous_source_paths.is_empty() {
+                Some(&previous_source_paths)
+            } else {
+                None
+            },
+        );
+
+        let result = match session.send_and_wait(&user_message).await {
+            Ok(raw_answer) => {
+                let answer = if shared.is_unchanged(&input.question) {
+                    if let Some(prev) = &input.previous_answer {
+                        eprintln!("\x1b[32m✓\x1b[0m No update needed: {}", input.question);
+                        prev.clone()
+                    } else {
+                        tracing::warn!(
+                            "AI called mark_unchanged but no previous answer for '{}'; treating as empty",
+                            input.question
+                        );
+                        raw_answer
+                    }
+                } else {
+                    eprintln!("\x1b[32m✓\x1b[0m Answered ({} bytes): {}", raw_answer.len(), input.question);
+                    raw_answer
+                };
+
+                let recorded = shared.drain_sources();
+                let sources = resolve_recorded_sources(root, recorded, input.source_hashes.clone());
+
+                Ok(AnswerResult {
+                    question: input.question.clone(),
+                    answer,
+                    sources,
+                })
+            }
+            Err(e) => Err(e),
+        };
+
+        results.push(result);
+    }
+
+    if let Err(e) = session.destroy().await {
+        tracing::warn!("Failed to destroy session: {}", e);
+    }
+
+    results
+}
+
 /// Answer multiple questions using a pool of worker tasks.
-/// Each worker pulls questions from a shared queue, creates a fresh session per question
-/// (to avoid conversation history bloat), and returns results in original order.
-/// One copilot process is shared across all workers.
+/// Questions sharing the same output file are answered in a single session so
+/// the AI can reuse file context across questions. Workers process groups
+/// concurrently — one session per group, up to `concurrency` sessions at once.
 pub async fn answer_questions_concurrent(
     root: &Path,
     questions: Vec<QuestionInput>,
     concurrency: usize,
     model: &str,
 ) -> Result<Vec<Result<AnswerResult>>> {
-    let client = Arc::new(Client::new(ClientOptions {
-        working_directory: Some(root.to_path_buf()),
-        ..Default::default()
-    }).await?);
+    let client = Arc::new(
+        Client::new(ClientOptions {
+            working_directory: Some(root.to_path_buf()),
+            ..Default::default()
+        })
+        .await?,
+    );
     let root = root.to_path_buf();
     let model = model.to_string();
     let total = questions.len();
 
-    // Build a shared work queue (indexed for result ordering)
-    let queue: Arc<Mutex<Vec<(usize, QuestionInput)>>> = Arc::new(Mutex::new(
-        questions.into_iter().enumerate().collect(),
-    ));
+    // Group questions by output_path, preserving original indices for result ordering
+    let mut groups: std::collections::HashMap<PathBuf, Vec<(usize, QuestionInput)>> =
+        std::collections::HashMap::new();
+    for (i, q) in questions.into_iter().enumerate() {
+        groups.entry(q.output_path.clone()).or_default().push((i, q));
+    }
+    // Sort each group by original index so questions are answered in declaration order
+    for group in groups.values_mut() {
+        group.sort_by_key(|(i, _)| *i);
+    }
+
+    // Build work queue of groups
+    let queue: Arc<Mutex<Vec<Vec<(usize, QuestionInput)>>>> =
+        Arc::new(Mutex::new(groups.into_values().collect()));
 
     let results: Arc<Mutex<Vec<(usize, Result<AnswerResult>)>>> =
         Arc::new(Mutex::new(Vec::with_capacity(total)));
 
-    // Spawn min(concurrency, total) workers
-    let workers = concurrency.min(total);
+    // Spawn min(concurrency, num_groups) workers, each processing one group at a time
+    let num_groups = { queue.lock().await.len() };
+    let workers = concurrency.min(num_groups);
     let mut handles = Vec::new();
 
     for worker_id in 0..workers {
@@ -474,23 +692,29 @@ pub async fn answer_questions_concurrent(
 
         handles.push(tokio::spawn(async move {
             loop {
-                let item = { queue.lock().await.pop() };
-                let (idx, input) = match item {
-                    Some(item) => item,
+                let group = { queue.lock().await.pop() };
+                let group = match group {
+                    Some(g) => g,
                     None => break,
                 };
 
-                tracing::debug!("Worker {} answering question {}/{}", worker_id, idx + 1, total);
+                tracing::debug!(
+                    "Worker {} processing group of {} question(s)",
+                    worker_id,
+                    group.len()
+                );
 
-                let result = answer_question(
-                    &root,
-                    &input,
-                    &client,
-                    &model,
-                )
-                .await;
+                let indices: Vec<usize> = group.iter().map(|(i, _)| *i).collect();
+                let inputs: Vec<QuestionInput> =
+                    group.into_iter().map(|(_, q)| q).collect();
 
-                results.lock().await.push((idx, result));
+                let group_results =
+                    answer_questions_in_session(&root, &inputs, &client, &model).await;
+
+                let mut locked = results.lock().await;
+                for (idx, result) in indices.into_iter().zip(group_results.into_iter()) {
+                    locked.push((idx, result));
+                }
             }
         }));
     }
